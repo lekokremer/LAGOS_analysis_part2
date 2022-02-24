@@ -1,0 +1,233 @@
+---
+title: "Lake Water Quality Analysis"
+author: "Lauren Kremer"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,
+                      message = F,
+                      warning = FALSE,
+                      fig.keep='all')
+
+pkgTest <- function(x)
+{
+  if (x %in% rownames(installed.packages()) == FALSE) {
+    install.packages(x, dependencies= TRUE)
+  }
+  library(x, character.only = TRUE)
+}
+
+# Make a vector of the packages you need
+neededPackages <- c('tidyverse',  'mapview', 'LAGOSNE', 'USAboundaries', 'lubridate') 
+
+for (package in neededPackages){pkgTest(package)}
+
+library(sf) 
+mapviewOptions(fgb = FALSE)
+# sf Spatial package that can read and create shapefiles 
+# mapview Interactive maps
+# LAGOSNE Lots and lots of clean lake data
+# USAboundaries USA states and counties
+# lubridate For dealing with date and time
+```
+
+
+# LAGOS Analysis
+
+
+## Loading in data
+
+
+### First download and then specifically grab the locus (or site lat longs)
+```{r data-read}
+#Lagos download script
+#lagosne_get(dest_folder = LAGOSNE:::lagos_path(),overwrite=T)
+
+#Load in lagos
+lagos <- lagosne_load()
+
+#Grab the lake centroid info
+lake_centers <- lagos$locus
+
+# Make an sf object 
+spatial_lakes <- st_as_sf(lake_centers,coords=c('nhd_long','nhd_lat'),
+                          crs=4326)
+
+#Grab the water quality data
+nutr <- lagos$epi_nutr
+
+```
+
+### Subset columns nutr to only keep key info that we want
+
+
+```{r}
+clarity_only <- nutr %>%
+  select(lagoslakeid,sampledate,chla,doc,secchi) %>%
+  mutate(sampledate = as.character(sampledate) %>% ymd(.))
+
+```
+
+
+### Keep sites with at least 200 observations 
+
+```{r}
+
+#Look at the number of rows of dataset
+#nrow(clarity_only)
+
+chla_secchi <- clarity_only %>%
+  filter(!is.na(chla),
+         !is.na(secchi))
+
+# Keep only the lakes with at least 200 observations of secchi and chla
+chla_secchi_200 <- chla_secchi %>%
+  group_by(lagoslakeid) %>%
+  mutate(count = n()) %>%
+  filter(count > 200)
+
+```
+
+
+### Join water quality data to spatial data
+
+```{r}
+spatial_200 <- inner_join(spatial_lakes,chla_secchi_200 %>%
+                            distinct(lagoslakeid,.keep_all=T),
+                          by='lagoslakeid')
+```
+
+### Mean Chl_a map
+
+```{r}
+### Take the mean chl_a and secchi by lake
+mean_values_200 <- chla_secchi_200 %>%
+  # Take summary by lake id
+  group_by(lagoslakeid) %>%
+  # take mean chl_a per lake id
+  summarize(mean_chl = mean(chla,na.rm=T),
+            mean_secchi=mean(secchi,na.rm=T)) %>%
+  #Get rid of NAs
+  filter(!is.na(mean_chl),
+         !is.na(mean_secchi)) %>%
+  # Take the log base 10 of the mean_chl
+  mutate(log10_mean_chl = log10(mean_chl))
+
+#Join datasets
+mean_spatial <- inner_join(spatial_lakes,mean_values_200,
+                          by='lagoslakeid') 
+
+#Make a map
+mapview(mean_spatial,zcol='log10_mean_chl')
+```
+
+
+# Class work
+
+## 1) What is the correlation between Secchi Disk Depth and Chlorophyll a
+for sites with at least 200 observations?
+
+- Here, I just want a plot of chla vs secchi for all sites 
+
+```{r}
+# the df mean_values_200 should have the columns needed for this:
+str(mean_values_200)
+# 64 means (lakes) from at least 200 observations as generated with 'chla_secchi_200'
+
+# Plot chla vs secchi depth
+ggplot(mean_values_200, aes(mean_chl, mean_secchi))+
+  geom_line() +
+  geom_smooth() +
+   ylab('Mean secchi depth (m)') +
+   xlab('Mean chla (mg/L)') +
+   #scale_color_manual(values=c("#999999", "#025D6B")) +
+    theme(panel.background = element_blank(), 
+          axis.line = element_line(color = 'black'))
+
+```
+
+
+## Why might this be the case? 
+
+**Response**<br/>
+**Increased chlorophyll concentrations would be expected to decrease the clarity of the water, thereby decreasing the depth at which the secchi disk can be observed. Furthermore, high chla concentrations may be indicative of other nutrients or organic material in the water column which may support higher chla concentrations, but also decrease clarity.**
+
+## 2) What states have the most data? 
+
+### 2a) First you will need to make a lagos spatial dataset 
+that has the total number of counts per site.
+
+```{r}
+# I am going to assume this means spatial data rather than nutrient data.
+
+# Start with a spatial dataset from lagos centroids and state information
+# I opted for merge here over _join bc some rows were lost from locus with join regardless of whether left or inner was used.
+center_n_state <- merge(lagos$locus, lagos$state, by = 'state_zoneid', all.x = T) 
+
+#2a. 'make a lagos spatial dataset that has the total number of counts per site' 
+spatial_lakes_counts <- center_n_state %>%
+  select(lagoslakeid, state_name) %>%
+  group_by(lagoslakeid, state_name) %>%
+  summarize(per_lake_count = n()) # 942703 observations
+
+state_lakes_counts <- spatial_lakes_counts %>%
+  group_by(state_name) %>%
+  summarize(per_state_count = sum(per_lake_count))
+
+ggplot(spatial_lakes_counts, aes(as.factor(state_name))) +
+  geom_bar() +
+  xlab('State name') +
+  ylab('No. of observations') +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+```
+
+
+### 2b) Second, you will need to join this point dataset to the us_boundaries data. 
+
+```{r}
+states <- us_states() %>%
+  st_transform(2163)
+  
+data_n_boundaries <- st_as_sf(left_join(state_lakes_counts, states, by = 'state_name'))
+
+```
+
+
+### 2c) Then you will want to group by state 
+and sum all the observations in that state and arrange that data from most to least total observations per state. 
+
+```{r}
+# Plot same data as above as map with state boundaries
+data_n_boundaries %>%
+  select(c(state_name, per_state_count, geometry)) %>%
+  arrange(-per_state_count) %>%
+  mapview(.,zcol = 'per_state_count')
+```
+
+## 3 Is there a spatial pattern in Secchi disk depth 
+for lakes with at least 200 observations?
+
+```{r}
+# Use the dataframe from upstream that contains sites with at least 200 observations and geometries to evaluate spatial pattern
+pal <-  mapviewPalette("mapviewSpectralColors")
+
+mean_spatial %>%
+  select(c(lagoslakeid, mean_secchi, geometry)) %>%
+  arrange(mean_secchi) %>%
+  mapview(.,zcol = 'mean_secchi', col.regions= pal,
+         cex = 'mean_secchi', legend = T)
+
+```
+
+**Response**<br/>
+**This map indicates that western states within this dataset (MN, MO, AL) may have reduced secchi depths relative to those in northeastern states(e.g.,NY, VT, NH, CT) and in northern WI.**
